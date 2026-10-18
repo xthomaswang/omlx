@@ -2983,6 +2983,51 @@ class TestExtractMultimodalContent:
         assert "success" in result[0]["content"]
         assert isinstance(result[0]["content"], str)
 
+    def test_tool_message_image_moves_to_a_following_user_message(self):
+        """An image in a tool message reaches the VLM: the tool result keeps its text,
+        and the image follows in a user message (as for Anthropic tool_result blocks)."""
+        screenshot = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        messages = [
+            Message(role="user", content="Take a screenshot."),
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "screenshot", "arguments": "{}"}}],
+            ),
+            Message(role="tool", content=[{"type": "text", "text": "Screenshot taken."}, screenshot], tool_call_id="call_1"),
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        assert "Screenshot taken." in result[-2]["content"]
+        assert "base64" not in result[-2]["content"]
+        assert result[-1] == {"role": "user", "content": [screenshot]}
+
+    def test_tool_message_images_merge_into_the_next_user_message(self):
+        """Images from consecutive tool messages stay in order and join the user turn after them."""
+        first = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        second = {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+        messages = [
+            Message(
+                role="assistant",
+                content=None,
+                tool_calls=[
+                    {"id": "call_1", "type": "function", "function": {"name": "screenshot", "arguments": "{}"}},
+                    {"id": "call_2", "type": "function", "function": {"name": "screenshot", "arguments": "{}"}},
+                ],
+            ),
+            Message(role="tool", content=[first], tool_call_id="call_1"),
+            Message(role="tool", content=[second], tool_call_id="call_2"),
+            Message(role="user", content="What changed?"),
+        ]
+
+        result = extract_multimodal_content(messages)
+
+        images = [part for msg in result if isinstance(msg["content"], list) for part in msg["content"] if part["type"] == "image_url"]
+        assert images == [first, second]
+        assert result[-1]["role"] == "user"
+        assert result[-1]["content"][-1] == {"type": "text", "text": "What changed?"}
+
     def test_converts_input_text_and_input_image(self):
         """Responses-style input_text/input_image should normalize for VLM."""
         messages = [

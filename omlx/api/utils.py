@@ -1186,6 +1186,10 @@ def extract_multimodal_content(
         List of message dicts. Messages with images have content as list.
     """
     processed_messages = []
+    # Image parts of tool messages (e.g. computer-use screenshots). Chat templates
+    # render tool content as text, so, as convert_anthropic_to_internal does for
+    # tool_result blocks, they go into a user message after the run of tool messages.
+    tool_images: list[dict] = []
 
     for msg in messages:
         role = msg.role
@@ -1200,12 +1204,21 @@ def extract_multimodal_content(
         if role == "developer":
             role = "system"
 
-        # Tool response messages - same as extract_text_content
+        if role != "tool" and tool_images:
+            processed_messages.append({"role": "user", "content": tool_images})
+            tool_images = []
+
+        # Tool response messages - same as extract_text_content, but images are kept
         if role == "tool":
             tool_call_id = getattr(msg, "tool_call_id", None) or ""
             # Convert list content to string if needed
             if isinstance(content, list):
                 tool_content = _extract_text_from_content_list(content)
+                tool_images.extend(
+                    part
+                    for part in _extract_multimodal_content_list(content)
+                    if part.get("type") == "image_url"
+                )
             else:
                 tool_content = content if content else ""
             if max_tool_result_tokens and tokenizer and tool_content:
@@ -1332,6 +1345,9 @@ def extract_multimodal_content(
                 )
         else:
             processed_messages.append({"role": role, "content": str(content), **_extra})
+
+    if tool_images:
+        processed_messages.append({"role": "user", "content": tool_images})
 
     processed_messages = _drop_void_assistant_messages(processed_messages)
     if consolidate_system_messages:
