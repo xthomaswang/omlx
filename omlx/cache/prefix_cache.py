@@ -316,9 +316,10 @@ class BlockAwarePrefixCache(CacheManager):
 
         # Supersede-on-extend lineage: newest tip block hash -> previous tip
         # block hash. When a chain is extended again, the tip two generations
-        # back is dropped: a tail is deleted, a rotating full block loses its
-        # rotating payload (see _strip_rotating_payload). The immediate
-        # previous tip is kept intact as the walk-back fallback.
+        # back is dropped: a tail is deleted (unless it is a head tail, see
+        # _head_tail_hashes), a rotating full block loses its rotating payload
+        # (see _strip_rotating_payload). The immediate previous tip is kept
+        # intact as the walk-back fallback.
         self._tip_lineage: dict[bytes, bytes] = {}
 
         # Hashes this session stored as tip blocks. A lineage entry is only
@@ -336,6 +337,14 @@ class BlockAwarePrefixCache(CacheManager):
         # Tails stored this session. A superseded tail is deleted, not
         # stripped: a stripped tail is only walked back over on restore.
         self._tail_hashes: set[bytes] = set()
+
+        # Head tails: root tails a store did not grow from an earlier tail,
+        # i.e. the first prompt of a chain shorter than one block (system
+        # prompt, tools, first message). Supersede-on-extend keeps them: a
+        # request that keeps the head and drops the turns after it, or a new
+        # chain with the same head, can reuse nothing else. One per chain;
+        # the paged and SSD tiers' LRU eviction bounds them like any tail.
+        self._head_tail_hashes: set[bytes] = set()
 
         self._seed_tail_index(paged_ssd_cache_manager)
 
@@ -1607,6 +1616,13 @@ class BlockAwarePrefixCache(CacheManager):
                             self._tail_hashes.add(block.block_hash)
                             if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
                                 self._tail_hashes.clear()
+                            if parent_hash is None and superseded_tail_hash is None:
+                                if (
+                                    len(self._head_tail_hashes)
+                                    >= _TIP_LINEAGE_MAX_ENTRIES
+                                ):
+                                    self._head_tail_hashes.clear()
+                                self._head_tail_hashes.add(block.block_hash)
                             self._tail_blocks_stored += 1
                             tail_in_table = True
                         logger.debug(
@@ -1643,7 +1659,8 @@ class BlockAwarePrefixCache(CacheManager):
         # and edited-turn fallback, so the tip two generations back is dead
         # weight. Without dropping it, those blocks fill the hot cache after
         # ~10-20 turns and LRU eviction breaks the prefix chain (multi-turn
-        # cache hit collapses to 0%). Steady state: two heavy blocks per chain.
+        # cache hit collapses to 0%). Steady state: two heavy blocks per chain,
+        # plus its head tail when the head is shorter than a block.
         # Non-rotating layouts track tail tips only.
         rotating_layout = bool(layer_cache_types) and any(
             CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
@@ -1675,7 +1692,11 @@ class BlockAwarePrefixCache(CacheManager):
                     and prev_tip_hash in self._store_tip_hashes
                 ):
                     superseded = self._tip_lineage.pop(prev_tip_hash, None)
-                    if superseded is not None:
+                    # A head tail stays (see _head_tail_hashes).
+                    if (
+                        superseded is not None
+                        and superseded not in self._head_tail_hashes
+                    ):
                         if superseded in self._tail_hashes:
                             self._discard_tail_block(superseded, layer_cache_types)
                         elif rotating_layout:
@@ -5538,6 +5559,7 @@ class BlockAwarePrefixCache(CacheManager):
         self._store_tip_hashes.clear()
         self._backfill_checked_hashes.clear()
         self._tail_hashes.clear()
+        self._head_tail_hashes.clear()
         self.paged_cache.clear()
         self.reset_stats()
         return cleared_count

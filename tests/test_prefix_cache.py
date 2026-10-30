@@ -718,6 +718,7 @@ class TestBlockAwarePrefixCache:
         prefix_cache._store_tip_hashes.add(b"c")
         prefix_cache._backfill_checked_hashes.add(b"d")
         prefix_cache._tail_hashes.add(b"e")
+        prefix_cache._head_tail_hashes.add(b"f")
 
         prefix_cache.clear()
 
@@ -725,6 +726,7 @@ class TestBlockAwarePrefixCache:
         assert prefix_cache._store_tip_hashes == set()
         assert prefix_cache._backfill_checked_hashes == set()
         assert prefix_cache._tail_hashes == set()
+        assert prefix_cache._head_tail_hashes == set()
 
     def test_len(self, prefix_cache):
         """Test __len__ returns number of request entries."""
@@ -2140,6 +2142,91 @@ class TestArraysCacheLastBlockOnly:
             "turn-3-edited", list(range(11)) + [90, 91]
         )
         assert table.num_tokens == 11 and remaining == [90, 91]
+
+    def _tail_turn(self, mx, cache, paged_cache, config, request_id, tokens):
+        """Fetch, store with a tail at the end, release.
+
+        Returns the tokens the fetch reused and the stored tail's hash."""
+        n = len(tokens)
+        table, _ = cache.fetch_cache(request_id, tokens)
+        reused = table.num_tokens if table is not None else 0
+        snapshots = {
+            b: self._hybrid_state(mx, b, float(b)) for b in {(n // 4) * 4, n} if b > 0
+        }
+        stored = cache.store_cache(
+            request_id,
+            tokens,
+            self._hybrid_state(mx, n, float(n)),
+            model_cache_config=config,
+            boundary_snapshots=snapshots,
+            _store_tail_terminal=True,
+        )
+        paged_cache.release_for_eviction(stored.block_ids)
+        return reused, paged_cache.allocated_blocks[stored.block_ids[-1]].block_hash
+
+    def test_head_tail_kept_when_the_conversation_extends_it(self, mx):
+        """A head shorter than a block keeps its tail as the conversation grows.
+
+        An agent harness resends one head (system prompt, tools, first
+        message) with a growing conversation after it. The first request's
+        tail sits under the root, and it is the only snapshot a request that
+        keeps the head but drops the turns after it (a client trimming its
+        context window) can reuse. Supersede-on-extend deleted it on the
+        third store, so that request prefilled the head again."""
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        head = [0, 1, 2]  # shorter than block_size=4: the tail's parent is the root
+
+        _, head_tail = self._tail_turn(mx, cache, paged_cache, config, "t1", head)
+        self._tail_turn(mx, cache, paged_cache, config, "t2", list(range(7)))
+        self._tail_turn(mx, cache, paged_cache, config, "t3", list(range(11)))
+
+        deleted = [call.args[0] for call in mock_ssd.delete_block.call_args_list]
+        assert head_tail not in deleted
+        assert paged_cache.cached_block_hash_to_block.get_block(head_tail) is not None
+        table, remaining = cache.fetch_cache("trimmed", head + [90, 91, 92, 93])
+        assert table is not None and table.num_tokens == 3
+        assert remaining == [90, 91, 92, 93]
+
+    def test_head_tail_kept_across_branches(self, mx):
+        """Each branch that grows from the head leaves the head's tail in place."""
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+        head = [0, 1, 2]
+        _, head_tail = self._tail_turn(mx, cache, paged_cache, config, "t1", head)
+        for n in (7, 11, 15):
+            self._tail_turn(mx, cache, paged_cache, config, f"t-{n}", list(range(n)))
+
+        # The client trims its window: the head, then newer turns only.
+        branch = head + [90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101]
+        reused = [
+            self._tail_turn(mx, cache, paged_cache, config, f"b-{n}", branch[:n])[0]
+            for n in (7, 11, 15)
+        ]
+
+        assert reused == [3, 7, 11]
+        deleted = [call.args[0] for call in mock_ssd.delete_block.call_args_list]
+        assert head_tail not in deleted
+        # The superseded tails of both branches are still deleted.
+        assert len(deleted) == 2
+        table, _ = cache.fetch_cache("trimmed-again", head + [70, 71])
+        assert table is not None and table.num_tokens == 3
+
+    def test_only_the_head_tail_outlives_supersede(self, mx):
+        """Later tails under the root are superseded as before: one kept per head.
+
+        A short conversation stores a root tail on every turn until it fills
+        a block; keeping each of them would bring back the hot-cache growth
+        that supersede-on-extend exists to stop."""
+        cache, paged_cache, mock_ssd, config = self._tail_fixture(mx)
+
+        _, head_tail = self._tail_turn(mx, cache, paged_cache, config, "t1", [0])
+        _, second = self._tail_turn(mx, cache, paged_cache, config, "t2", [0, 1])
+        self._tail_turn(mx, cache, paged_cache, config, "t3", [0, 1, 2])
+        self._tail_turn(mx, cache, paged_cache, config, "t4", list(range(7)))
+
+        deleted = [call.args[0] for call in mock_ssd.delete_block.call_args_list]
+        assert deleted == [second]
+        assert paged_cache.cached_block_hash_to_block.get_block(second) is None
+        assert paged_cache.cached_block_hash_to_block.get_block(head_tail) is not None
 
     def test_store_cache_tail_dedup_reuses_existing_block(self, mx):
         """An identical tail under the same parent is reused, not re-saved."""
